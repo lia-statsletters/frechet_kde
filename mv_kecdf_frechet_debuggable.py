@@ -104,32 +104,46 @@ def calc_frechet_fails(guinea_cdf,frechets):
             'bottom': bot}
 
 
-def count_frechet_fails(guinea_cdf,frechets):
-    fails={'top':[], 'bottom':[]}
+def count_frechet_fails(guinea_cdf,frechets,methodstring=''):
+    fails={f'top_{methodstring}':[], f'bottom_{methodstring}':[]}
     for n in range(len(guinea_cdf)):
-        if guinea_cdf[n]>frechets['top'][n]:
-            fails['top'].append(True)
+        amount=guinea_cdf[n]-frechets[f'top'][n]
+        if amount>0:#guinea_cdf[n]>frechets['top'][n]:
+            fails[f'top_{methodstring}'].append(amount)
+            fails[f'bottom_{methodstring}'].append(0) #failed on top, cant fail bottom
         else:
-            fails['top'].append(False)
+            fails[f'top_{methodstring}'].append(0)
+            #no fails in top, check for fails in bottom.
+            amount=frechets[f'bottom'][n]-guinea_cdf[n]
+            if amount>0:
+                fails[f'bottom_{methodstring}'].append(amount)
+            else:
+                fails[f'bottom_{methodstring}'].append(0) #no fails on bottom either
+    return {f'top_{methodstring}':np.array(fails[f'top_{methodstring}']),
+            f'bottom_{methodstring}':np.array(fails[f'bottom_{methodstring}'])}
 
-        if guinea_cdf[n]<frechets['bottom'][n]:
-            fails['bottom'].append(True)
-        else:
-            fails['bottom'].append(False)
-    return {'top':np.array(fails['top']),
-            'bottom':np.array(fails['bottom'])}
+def get_frechets(F):
+    #F is a list of "d" cdfs
+    #Taken from remark 7.9 p225 of QRM book (McNeil, Frey, Embrechs)
+    #For a multivariate df F with margins F1, ... Fd holds:
+    # bottom <= F(\bf{x}) <= top ->
+    # max( sum^{i=1}_{d} (F_i(x_i) ) + 1-d, 0 ) <= F(\bf{x}) <= min (F_1(x_1), ... F_d(x_d))
 
-def get_frechets(dvars):
-    d=len(dvars)
-    n=len(dvars[0])
-    dimx=np.array(range(d))
-    un=np.ones(d,dtype=int)
-    bottom_frechet = np.array([max( np.sum( dvars[dimx,un*i] ) +1-d, 0 )
-                               for i in range(n) ])
-    top_frechet = np.array([min([y[i] for y in dvars]) for i in range(n)])
+    d=len(F)
+    samples=len(F[0])
+    constd=1-d
+    #easier-to-debug, arguably faster calculations
+    bottom_frechet=np.full(samples,float('nan'))
+    top_frechet=np.full(samples, float('nan'))
+    for n in range(samples):
+        bottom_frechet[n]=max(np.sum(F[:,n])+constd,0)
+        top_frechet[n]=min(F[:,n])
+
+    #sanity check: is bottom always lteq top?
+    print('is bottom always lteq top?',
+          sum(bottom_frechet<=top_frechet)==samples)
+
     return {'top': top_frechet, 'bottom': bottom_frechet}
-
-
 
 class LeaveOneOut(object):
     def __init__(self, X):
@@ -163,7 +177,7 @@ def cdf(dataxx, bw, var_type, frech_bounds=None):
     return cdf_est
 
 def frechet_likelihood(bww, datax, var_type, frech_bounds, func=None, debug_mode=False,):
-
+    #Todo: REDO THIS FUNCTION SINCE THE VIOLATIONS ARE NOW DISTANCES!!!!!
     cdf_est = cdf(datax, bww, var_type)  # frech_bounds=frech_bounds)
     d_violations = calc_frechet_fails(cdf_est, frech_bounds)
     width_bound = frech_bounds['top'] - frech_bounds['bottom']
@@ -188,7 +202,12 @@ def loo_likelihood(bww, datax, var_type, func=lambda x: x, debug_mode=False):
     for i, X_not_i in enumerate(LOO):
         f_i = gpke(bww, dataxx=-X_not_i, data_predict=-datax[i, :],
                    var_type=var_type)
-        L += func(f_i)
+        try:
+            L += func(f_i)
+        except:
+            print('wtf f_i fucks up log likelihood in LOO!!! keep last value')
+            continue
+
     if debug_mode:
         print('\n',bww,'Log likelihood:',-L)
     return -L
@@ -210,83 +229,101 @@ def get_bw(datapfft, var_type, reference, frech_bounds=None):
         argsx=(None,) #second element of tuple is if debug mode
 
     h0 = reference
-    bw = optimize.fmin(fmin, x0=h0, args=argsx, #feeding logarithm for loo
-                       maxiter=1e3, maxfun=1e3, disp=0, xtol=1e-3)
+    #old
+    #bw = optimize.fmin(fmin, x0=h0, args=argsx, #feeding logarithm for loo
+    #                   maxiter=1e3, maxfun=1e3, disp=0, xtol=1e-3)
+    #Gradient norm must be less than gtol before successful termination.
+    bw = optimize.minimize(fmin,h0,method='BFGS',args=argsx,
+                           options={'disp':True,'maxiter':1e3, 'gtol':1e-3})
     # bw = self._set_bw_bounds(bw)  # bound bw if necessary
-    return bw
+    return bw.x, bw.success #solution
 
-#@profile(sort='cumulative',filename='/home/lia/liaProjects/outs/experiments.txt')
-def profile_run(rd,frechets,iterx):
-    dims=len(rd)
-    n=len(rd[0])
+#@profile(sort='cumulative',filename='./out/experiments.txt')
+def profile_run(data,frechets,iterx,name,mode):
+    dims=len(data)
+    n=len(data[0])
     v_type = f'{"c"*dims}'
     # threshold: number of violations by the cheapest method.
-    dens_u_rot = sm.nonparametric.KDEMultivariate(data=rd, var_type=v_type, bw='normal_reference')
+    dens_u_rot = sm.nonparametric.KDEMultivariate(data=data, var_type=v_type, bw='normal_reference')
     cdf_dens_u_rot = dens_u_rot.cdf()
-    violations_rot = count_frechet_fails(cdf_dens_u_rot, frechets)
-
+    violations = count_frechet_fails(cdf_dens_u_rot, frechets,methodstring='silverman')
 
     #profile frechets
-    pr = cProfile.Profile()
-    pr.enable()
-    bw_frechets = get_bw(rd, v_type, dens_u_rot.bw, frech_bounds=frechets)
-    pr.disable()
+    if mode=='exp':
+        pr = cProfile.Profile()
+        pr.enable()
+    bw_frechets,frechet_success = get_bw(data, v_type, dens_u_rot.bw, frech_bounds=frechets)
+    if mode == 'exp':
+        pr.disable()
+    cdf_frechet=sm.nonparametric.KDEMultivariate(data=data, var_type=v_type,
+                                                 bw=bw_frechets).cdf()
+    violations.update(count_frechet_fails(cdf_frechet, frechets, methodstring='frechet'))
 
-    s = io.StringIO()
-    ps = pstats.Stats(pr, stream=s).sort_stats('cumtime')
-    ps.print_stats()
-    s = s.getvalue()
-
-    with open(f'/home/lia/liaProjects/outs/frechet-profile-d{dims}-n{n}-iter{iterx}.txt', 'w+') as f:
-        f.write(s)
-
+    if mode == 'exp':
+        s = io.StringIO()
+        ps = pstats.Stats(pr, stream=s).sort_stats('cumtime')
+        ps.print_stats()
+        s = s.getvalue()
+        with open(f'./out/{name}_frechet-profile-d{dims}-n{n}-iter{iterx}.txt', 'w+') as f:
+            f.write(s)
 
     #profile cv_ml
-    pr = cProfile.Profile()
-    pr.enable()
-    bw_cv_ml = get_bw(rd, v_type, dens_u_rot.bw)
-    pr.disable()
+    if mode == 'exp':
+        pr = cProfile.Profile()
+        pr.enable()
+    bw_cv_ml,cv_ml_success = get_bw(data, v_type, dens_u_rot.bw)
+    if mode == 'exp':
+        pr.disable()
+    cdf_cv_ml=sm.nonparametric.KDEMultivariate(data=data, var_type=v_type,
+                                                 bw=bw_cv_ml).cdf()
+    violations.update(count_frechet_fails(cdf_cv_ml, frechets,methodstring='cv_ml'))
 
-    s = io.StringIO()
-    ps = pstats.Stats(pr, stream=s).sort_stats('cumtime')
-    ps.print_stats()
-    s = s.getvalue()
+    if mode == 'exp':
+        s = io.StringIO()
+        ps = pstats.Stats(pr, stream=s).sort_stats('cumtime')
+        ps.print_stats()
+        s = s.getvalue()
 
-    with open(f'/home/lia/liaProjects/outs/loo-ml-profile-d{dims}-n{n}-iter{iterx}.txt', 'w+') as f:
-        f.write(s)
+        with open(f'./out/{name}_loo-ml-profile-d{dims}-n{n}-iter{iterx}.txt', 'w+') as f:
+            f.write(s)
+
+    return bw_frechets,bw_cv_ml, violations
 
 
-    return bw_frechets,bw_cv_ml
-
-
-def generate_experiments(reps,n,params, distr, dims):
+def generate_experiments(reps,n,params, distr, dims, name='horns_horns1',mode='exp'):
     bws_frechet={f'bw_{x}':[] for x in params}
     bws_cv_ml={f'bw_{x}':[] for x in params}
 
+    points=np.linspace(0.001,0.999,num=n)
 
     for iteration in range(reps):
-        mvdata = {k: distr.rvs(*params[k], size=n) for k in params}
-        rd = np.array(list(mvdata.values()))
+        F = {k: distr.cdf(points,*params[k]) for k in params}
+        data = {k: distr.rvs(*params[k], size=n) for k in params}
 
         # get frechets and thresholds
-        frechets = get_frechets(rd)
-
-        bw_frechets, bw_cv_ml=profile_run(rd, frechets,iteration)
+        frechets = get_frechets(np.array(list(F.values())))
+        # profile bw with frechets and bw with cross-validation maximum-likelihood
+        bw_frechets, bw_cv_ml, violations=profile_run(np.array(list(data.values())),
+                                                      frechets,iteration,name,mode)
 
         for ix,x in enumerate(params):
             bws_frechet[f'bw_{x}'].append(bw_frechets[ix])
             bws_cv_ml[f'bw_{x}'].append(bw_cv_ml[ix])
+        #store data for this experiment
+        outable=pd.concat([pd.DataFrame(data),pd.DataFrame(violations)],axis=1)
+        outable.to_csv(f'./out/{name}_data_d{dims}-n{n}-iter{iteration}-{reps}.csv',index=False)
 
-    pd.DataFrame(bws_frechet).to_csv(f'/home/lia/liaProjects/outs/bws_frechet_d{dims}-n{n}-iter{reps}.csv')
-    pd.DataFrame(bws_cv_ml).to_csv(f'/home/lia/liaProjects/outs/bws_cv_ml_d{dims}-n{n}-iter{reps}.csv')
+    #store bandwidths by each method
+    pd.DataFrame(bws_frechet).to_csv(f'./out/{name}_bws_frechet_d{dims}-n{n}-iter{reps}.csv',index=False)
+    pd.DataFrame(bws_cv_ml).to_csv(f'./out/{name}_bws_cv_ml_d{dims}-n{n}-iter{reps}.csv',index=False)
 
 
 def aggregate_experiments():
-
-    fl = f'/home/lia/liaProjects/outs/d{dims}-n{n}-reps{reps}.csv'
+    #todo: finish
+    fl = f'./out/d{dims}-n{n}-reps{reps}.csv'
     #with open(fl, 'w+') as f:
     #    s = io.StringIO()
-    #    k = pstats.Stats('/home/lia/liaProjects/outs/experiments.txt', stream=s).sort_stats('cumtime')
+    #    k = pstats.Stats('./out/experiments.txt', stream=s).sort_stats('cumtime')
     #    k.print_stats()
     #    f.write(s.getvalue())
 
@@ -297,9 +334,10 @@ def aggregate_experiments():
                     ).rename(columns={'filename:lineno(function)': 'from_func'}).dropna()
     tokeep = np.where([1 if not not re.search('likelihood', x) else 0 for x in k.from_func.values])[0]
     k = k.iloc[tokeep]
-    repl=['frechet' if not not re.search('frechet_likelihood', x) else 'loo_cv_ml' for x in k.from_func.values]
+    repl=['frechet' if not not re.search('frechet_likelihood', x)
+          else 'loo_cv_ml' for x in k.from_func.values]
     k['from_func']=np.array(repl)
-    k.to_csv(f'/home/lia/liaProjects/outs/summary_d{dims}-n{n}-reps{reps}.csv',
+    k.to_csv(f'./out/summary_d{dims}-n{n}-reps{reps}.csv',
              index=False)
 
 def main():
@@ -312,10 +350,11 @@ def main():
               #'symetric': (2., 2.)
               }
     dims = len(params)
-    ns = [300, 600, 1000, 3000, 4000]
+    ns = [125]#,125, 250, 500, 1000]
     distr = spst.beta
     for n in ns:
-        generate_experiments(reps,n,params,distr,dims)
+        generate_experiments(reps,n,params,distr,dims,
+                             name='horns_horns1',mode='debug')
 
     #lets_be_tidy(rd,frechets)
 
